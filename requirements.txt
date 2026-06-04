@@ -1,0 +1,9 @@
+neo4j
+requests
+camel-ai
+edge-tts
+pygame
+openai-whisper
+sounddevice
+soundfile
+numpy
