@@ -308,6 +308,37 @@ class Neo4jKG:
             "past_episodes": episode_rows,
         }
 
+    def add_episode(self, context: str, partner: str, utterances: str, mcds: float, success: bool, emotion: str):
+        """Adds a new interaction episode to the graph."""
+        import datetime
+        ep_id = f"ep_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        date  = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        self.run("""
+            CREATE (e:Episode {
+                ep_id:      $ep_id,
+                date:       $date,
+                context:    $context,
+                partner:    $partner,
+                utterances: $utterances,
+                mcds_score: $mcds,
+                successful: $success,
+                emotion:    $emotion
+            })
+        """, ep_id=ep_id, date=date, context=context, partner=partner,
+            utterances=utterances, mcds=mcds, success=success, emotion=emotion)
+            
+        self.run("""
+            MATCH (p:Patient {name: 'Aarav'}), (e:Episode {ep_id: $ep_id})
+            CREATE (p)-[:HAD_EPISODE]->(e)
+        """, ep_id=ep_id)
+        
+        self.run("""
+            MATCH (e:Episode {ep_id: $ep_id}), (person {name: $partner})
+            CREATE (e)-[:INVOLVED]->(person)
+        """, ep_id=ep_id, partner=partner)
+        print(f"[Neo4j] Episode {ep_id} added (Emotion: {emotion}).")
+
     def get_summary(self) -> dict:
         """Returns node and relationship counts for display."""
         node_counts = self.run("""

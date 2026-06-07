@@ -184,6 +184,14 @@ def approval_gate(transcript: str) -> tuple[bool, str]:
 
 # ── TTS OUTPUT ────────────────────────────────────────────────
 
+EMOTION_PROSODY = {
+    "happy":   {"rate": "+15%", "pitch": "+20Hz", "volume": "+0%"},
+    "sad":     {"rate": "-20%", "pitch": "-15Hz", "volume": "-10%"},
+    "tired":   {"rate": "-30%", "pitch": "-25Hz", "volume": "-20%"},
+    "angry":   {"rate": "+10%", "pitch": "-10Hz", "volume": "+25%"},
+    "neutral": {"rate": "+0%",  "pitch": "+0Hz",  "volume": "+0%"},
+}
+
 def clean_text_for_tts(text: str) -> str:
     text    = re.sub(r"[\"\'*•\-]", "", text)
     text    = re.sub(r"\[.*?\]",    "", text)
@@ -197,12 +205,18 @@ def clean_text_for_tts(text: str) -> str:
     return cleaned
 
 
-async def _synthesize_async(text: str, voice: str, filename: str):
-    communicate = edge_tts.Communicate(text=text, voice=voice)
+async def _synthesize_async(text: str, voice: str, filename: str, prosody: dict):
+    communicate = edge_tts.Communicate(
+        text=text, 
+        voice=voice,
+        rate=prosody.get("rate", "+0%"),
+        pitch=prosody.get("pitch", "+0%"),
+        volume=prosody.get("volume", "+0%")
+    )
     await communicate.save(filename)
 
 
-def synthesize_and_play(text: str, label: str = "output") -> str:
+def synthesize_and_play(text: str, emotion: str = "neutral", label: str = "output") -> str:
     os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
     timestamp  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = re.sub(r"\W+", "_", label)[:30]
@@ -213,10 +227,14 @@ def synthesize_and_play(text: str, label: str = "output") -> str:
         print("[TTS] Nothing to synthesize.")
         return ""
 
+    prosody = EMOTION_PROSODY.get(emotion.lower(), EMOTION_PROSODY["neutral"])
+
     print(f"\n[TTS] Voice      : {TTS_VOICE}")
+    print(f"[TTS] Emotion    : {emotion.upper()}")
+    print(f"[TTS] Prosody    : Rate={prosody['rate']}, Pitch={prosody['pitch']}, Vol={prosody['volume']}")
     print(f"[TTS] Synthesizing: \"{cleaned}\"")
 
-    asyncio.run(_synthesize_async(cleaned, TTS_VOICE, filename))
+    asyncio.run(_synthesize_async(cleaned, TTS_VOICE, filename, prosody))
     print(f"[TTS] Saved → {filename}")
 
     pygame.mixer.init()
@@ -308,11 +326,20 @@ def run_aac_pipeline(
         f"Aarav said (fragmented dysarthric speech): \"{final_transcript}\"\n\n"
         f"Context: {context}, talking to {partner}.\n\n"
         "Reconstruct what Aarav meant as 1 to 3 short, clear, natural phrases "
-        "a child would say. Use his preferred vocabulary from the context above. "
+        "a child would say. Use his preferred vocabulary from the context above. \n"
+        "MANDATORY: Start with an emotion tag in brackets, e.g., [Happy]. \n"
         "Keep each phrase under 6 words. First person only. No explanation."
     )
 
     generated = aac_agent.step(prompt)
+
+    # Parse emotion and clean text
+    emotion = "neutral"
+    match = re.search(r"\[(.*?)\]", generated)
+    if match:
+        emotion = match.group(1).lower()
+    
+    clean_generated = re.sub(r"\[.*?\]", "", generated).strip()
 
     # ── 7. Clinical guard ─────────────────────────────────────
     print("\n[ClinicalGuardAgent] Validating ...")
@@ -320,7 +347,8 @@ def run_aac_pipeline(
 
     print("\n── RESULT ────────────────────────────────────────────────")
     print(f"  Dysarthric input  : \"{final_transcript}\"")
-    print(f"  Structured output : \"{generated}\"")
+    print(f"  Inferred Emotion  : {emotion.upper()}")
+    print(f"  Structured output : \"{clean_generated}\"")
     print(f"  Guard             : {validation['status']}")
     if validation["violations"]:
         for v in validation["violations"]:
@@ -333,7 +361,7 @@ def run_aac_pipeline(
     if validation["status"] == "FAIL":
         print("\n  [!] Guard FAILED — synthesizing for demo.")
 
-    audio_out = synthesize_and_play(generated, label=f"{context}_{partner}")
+    audio_out = synthesize_and_play(clean_generated, emotion=emotion, label=f"{context}_{partner}")
 
     if audio_out:
         print(f"\n── AUDIO OUTPUT ──────────────────────────────────────────")
@@ -341,6 +369,16 @@ def run_aac_pipeline(
         print(f"  Output audio : {audio_out}")
         print(f"  Folder       : {os.path.abspath(AUDIO_OUTPUT_DIR)}")
     print("──────────────────────────────────────────────────────────")
+
+    # ── 9. Persist to KG ──────────────────────────────────────
+    kg_agent.kg.add_episode(
+        context    = context,
+        partner    = partner,
+        utterances = clean_generated,
+        mcds       = 0.60,  # placeholder baseline
+        success    = (validation["status"] == "PASS"),
+        emotion    = emotion
+    )
 
     return aac_agent, True
 

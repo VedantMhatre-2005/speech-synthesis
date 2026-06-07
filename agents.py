@@ -1,12 +1,13 @@
 """
-Camel AI agent definitions — Ollama/Mistral backend + Neo4j KG.
+Camel AI agent definitions — Ollama backend + Neo4j KG.
 """
 
 import requests
+import re
 from knowledge_graph import Neo4jKG, format_context_for_prompt
 
 OLLAMA_URL   = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "mistral"
+OLLAMA_MODEL = "qwen3:14B"
 
 
 # ── 1. KG CONTEXT AGENT ───────────────────────────────────────
@@ -51,22 +52,23 @@ class KGContextAgent:
 
 class OllamaMistralAgent:
     """
-    Sends structured chat messages to Mistral running inside Ollama.
+    Sends structured chat messages to Qwen/Mistral running inside Ollama.
     Maintains conversation history (last 10 turns).
     """
 
     def __init__(self, kg_context_str: str, linguistic_age: float):
         self.history       = []
         self.system_prompt = (
-            "You are an Augmentative and Alternative Communication (AAC) assistant "
-            "for a child named Aarav who has cerebral palsy and dysarthric speech. "
-            f"Aarav's linguistic age is {linguistic_age:.1f} years. "
-            "Generate ONLY short, simple phrases that Aarav would say. "
-            "Keep each phrase to 5 words or fewer. "
-            "Use only the vocabulary listed in the patient context below. "
-            "Output 1 to 3 phrases only. "
-            "Do NOT explain. Do NOT add commentary. "
-            "Speak as Aarav in first person.\n\n"
+            "You are an AAC assistant for Aarav (CP child, dysarthric speech). "
+            f"Linguistic age: {linguistic_age:.1f} years. \n\n"
+            "MANDATORY: Output ONLY the bracketed emotion and the reconstructed phrase. "
+            "Do NOT use chain-of-thought. Do NOT 'think' out loud. Response must be IMMEDIATE. \n\n"
+            "Format: [Emotion] Phrase \n"
+            "Allowed emotions: [Happy], [Sad], [Angry], [Tired], [Neutral]. \n\n"
+            "Tasks:\n"
+            "1. Infer emotion from his fragmented words.\n"
+            "2. Reconstruct intent into 1-3 short first-person phrases (max 5 words each).\n"
+            "3. Use only his preferred vocabulary.\n\n"
             + kg_context_str
         )
 
@@ -79,17 +81,21 @@ class OllamaMistralAgent:
             "messages": [{"role": "system", "content": self.system_prompt}]
                         + trimmed,
             "stream":   False,
-            "options":  {"temperature": 0.7, "num_predict": 150},
+            "options":  {"temperature": 0.7, "num_predict": 1000},
         }
 
         try:
-            response = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            response = requests.post(OLLAMA_URL, json=payload, timeout=120)
             response.raise_for_status()
-            reply = response.json()["message"]["content"].strip()
+            res_json = response.json()
+            if "message" in res_json and "content" in res_json["message"]:
+                reply = res_json["message"]["content"].strip()
+            else:
+                reply = f"[ERROR] Unexpected Ollama response: {res_json}"
         except requests.exceptions.ConnectionError:
             reply = "[ERROR] Ollama not running. Run: ollama serve"
         except requests.exceptions.Timeout:
-            reply = "[ERROR] Timeout. Run: ollama run mistral"
+            reply = f"[ERROR] Timeout with model {OLLAMA_MODEL}"
         except Exception as e:
             reply = f"[ERROR] {str(e)}"
 
@@ -100,8 +106,9 @@ class OllamaMistralAgent:
         """Call this when context changes (new scenario) but history should persist."""
         self.system_prompt = (
             "You are an AAC assistant for Aarav, a child with cerebral palsy. "
-            f"Aarav's linguistic age is {linguistic_age:.1f} years. "
-            "Generate ONLY 1–3 short first-person phrases he would say. "
+            f"Aarav's linguistic age is {linguistic_age:.1f} years. \n"
+            "MANDATORY: NO reasoning. NO thinking. Immediate response only. \n"
+            "Format: [Emotion] Phrase. \n"
             "Max 5 words per phrase. No commentary.\n\n"
             + kg_context_str
         )
@@ -136,7 +143,13 @@ class ClinicalGuardAgent:
 
     def validate(self, generated_text: str) -> dict:
         violations, warnings_ = [], []
-        words = generated_text.split()
+        
+        # Strip [Emotion] tag for validation
+        clean_text = re.sub(r"\[.*?\]", "", generated_text).strip()
+        words = clean_text.split()
+
+        if not words:
+            violations.append("Output is empty after removing emotion tags.")
 
         if len(words) > 25:
             violations.append(f"Output too long ({len(words)} words).")
@@ -147,7 +160,7 @@ class ClinicalGuardAgent:
                     f"'{word}' may exceed linguistic age {self.linguistic_age:.1f}."
                 )
 
-        lower = generated_text.lower()
+        lower = clean_text.lower()
         for flag in ["aarav", "he wants", "he says", "the patient", "the child"]:
             if flag in lower:
                 violations.append(f"Third-person narration detected: '{flag}'.")
