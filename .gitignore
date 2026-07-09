@@ -1,2 +1,28 @@
-__pycache__
-extracted_features/*
+# Python virtual environments
+venv/
+__pycache__/
+*.pyc
+
+# Massive Model Checkpoints (Do NOT push to Git!)
+whisper-dysarthric-lora/
+speech-synthesis/saved_models/
+speech-synthesis/saved_models_1k/
+speech_synthesis_dataset/checkpoints/
+
+# Massive Audio Datasets
+openvoice_output/
+speech_synthesis_dataset/openvoice_output/
+speech_synthesis_dataset/output_dataset/
+speech_synthesis_dataset/temp_openvoice/
+speech_synthesis_dataset/torgo_references/
+
+# Extracted Feature Vectors
+extracted_features/
+speech-synthesis/extracted_features/
+*.pt
+
+# Large data files & archives
+*.csv
+*.tar.gz
+*.wav
+*.mp3
