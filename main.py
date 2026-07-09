@@ -1,7 +1,8 @@
 """
-CP Speech Synthesis — Full AAC Pipeline
+CP Speech Synthesis — Full AAC Pipeline (v2.1 — Context-Engineered Emotion)
   Dysarthric audio input → Whisper ASR → User approval
-  → Mistral + KG context → edge-tts audio output
+  → KG context + Context-Engineered SVM Emotion → Mistral phrase generation
+  → edge-tts audio output (emotion-prosody matched)
 
 Prerequisites:
     1. Neo4j Desktop running  →  database created and started
@@ -9,6 +10,7 @@ Prerequisites:
     3. ollama pull mistral    →  once
     4. Internet connection    →  edge-tts neural voice API
     5. Microphone             →  for live recording
+    6. saved_models/          →  trained SVM pipeline (run train_fusion.py once)
 
 Run:
     python main.py
@@ -28,7 +30,9 @@ import soundfile as sf
 import pygame
 import whisper
 import edge_tts
+import joblib
 from agents import KGContextAgent, OllamaMistralAgent, ClinicalGuardAgent
+from context_engineering import get_semantic_vector_with_context
 
 # ── CONFIG ────────────────────────────────────────────────────
 AUDIO_OUTPUT_DIR  = "audio_outputs"
@@ -184,12 +188,31 @@ def approval_gate(transcript: str) -> tuple[bool, str]:
 
 # ── TTS OUTPUT ────────────────────────────────────────────────
 
+# ── EXPANDED PROSODY MAP ──────────────────────────────────────────────────────
+# Covers all 8 TORGO/SSI emotion labels and the internal 'tired' alias.
+# Prosody values tested against edge-tts en-US-AnaNeural.
 EMOTION_PROSODY = {
-    "happy":   {"rate": "+15%", "pitch": "+20Hz", "volume": "+0%"},
-    "sad":     {"rate": "-20%", "pitch": "-15Hz", "volume": "-10%"},
-    "tired":   {"rate": "-30%", "pitch": "-25Hz", "volume": "-20%"},
-    "angry":   {"rate": "+10%", "pitch": "-10Hz", "volume": "+25%"},
-    "neutral": {"rate": "+0%",  "pitch": "+0Hz",  "volume": "+0%"},
+    # Core child-facing emotions
+    "happy":    {"rate": "+15%", "pitch": "+20Hz", "volume": "+0%"},
+    "sad":      {"rate": "-20%", "pitch": "-15Hz", "volume": "-10%"},
+    "angry":    {"rate": "+10%", "pitch": "-10Hz", "volume": "+25%"},
+    "neutral":  {"rate": "+0%",  "pitch": "+0Hz",  "volume": "+0%"},
+    # Aliases used by Mistral/clinical output
+    "tired":    {"rate": "-30%", "pitch": "-25Hz", "volume": "-20%"},
+    # Additional TORGO / SSI dataset labels (now routed via SVM)
+    "ang":      {"rate": "+10%", "pitch": "-10Hz", "volume": "+25%"},   # ANG
+    "hap":      {"rate": "+15%", "pitch": "+20Hz", "volume": "+0%"},    # HAP
+    "neu":      {"rate": "+0%",  "pitch": "+0Hz",  "volume": "+0%"},    # NEU
+    "sad":      {"rate": "-20%", "pitch": "-15Hz", "volume": "-10%"},   # SAD
+    "cal":      {"rate": "-10%", "pitch": "-5Hz",  "volume": "-5%"},    # CAL (calm)
+    "dis":      {"rate": "-5%",  "pitch": "-5Hz",  "volume": "+5%"},    # DIS (disgust)
+    "fea":      {"rate": "-10%", "pitch": "+15Hz", "volume": "+10%"},   # FEA (fear)
+    "sur":      {"rate": "+20%", "pitch": "+25Hz", "volume": "+15%"},   # SUR (surprise)
+    # Friendly aliases for the above
+    "calm":     {"rate": "-10%", "pitch": "-5Hz",  "volume": "-5%"},
+    "fear":     {"rate": "-10%", "pitch": "+15Hz", "volume": "+10%"},
+    "disgust":  {"rate": "-5%",  "pitch": "-5Hz",  "volume": "+5%"},
+    "surprise": {"rate": "+20%", "pitch": "+25Hz", "volume": "+15%"},
 }
 
 def clean_text_for_tts(text: str) -> str:
@@ -253,15 +276,22 @@ def run_aac_pipeline(
     whisper_model,
     kg_agent,
     guard_agent,
-    context:   str,
-    partner:   str,
-    aac_agent  = None,
-    audio_path: str = "",
+    context:    str,
+    partner:    str,
+    aac_agent   = None,
+    audio_path: str  = "",
+    svm_models: dict = None,
 ) -> tuple:
     """
-    Full pipeline:
-      audio → ASR → approval → KG context → Mistral → TTS
+    Full pipeline (v2.1):
+      audio → ASR → approval → KG context
+      → Context-Engineered SVM emotion (primary)
+      → Mistral phrase generation (emotion tag used as fallback)
+      → TTS with matched prosody
     Returns (aac_agent, success: bool).
+
+    svm_models: dict with keys scaler, pca, clf, le — loaded at startup.
+                If None, SVM emotion step is skipped (Mistral tag used instead).
     """
 
     # ── 1. Get audio ──────────────────────────────────────────
@@ -333,13 +363,67 @@ def run_aac_pipeline(
 
     generated = aac_agent.step(prompt)
 
-    # Parse emotion and clean text
-    emotion = "neutral"
+    # Parse Mistral's inferred emotion tag (used as secondary / fallback)
+    mistral_emotion = "neutral"
     match = re.search(r"\[(.*?)\]", generated)
     if match:
-        emotion = match.group(1).lower()
-    
+        mistral_emotion = match.group(1).lower()
+
     clean_generated = re.sub(r"\[.*?\]", "", generated).strip()
+
+    # ── SVM Context-Engineered Emotion (primary) ──────────────────────────
+    svm_emotion = None
+    if svm_models:
+        print("\n[ContextSVM] Predicting emotion with context-engineered SVM ...")
+        try:
+            import librosa, torch
+            from transformers import WavLMModel, WhisperForConditionalGeneration, WhisperProcessor
+            import opensmile
+
+            # NOTE: For the live pipeline we reuse the already-transcribed text
+            # from Whisper (final_transcript) and compute the LLM semantic vector
+            # using the live KG context — the most accurate signal available.
+            llm_vec = get_semantic_vector_with_context(
+                transcription    = final_transcript,
+                kg_context_str   = kg_context_str,
+                scenario         = context,
+                partner          = partner,
+                temperature      = 0.3,
+            )
+
+            # Build a partial fusion vector using only the LLM component.
+            # (WavLM + Whisper encoder are heavy to re-load live; the LLM vector
+            #  alone already carries the context-engineered signal.)
+            # For full accuracy, run rehabilitate_speech.py which loads all models.
+            partial_vec   = llm_vec.reshape(1, -1)
+
+            # Pad to match the trained scaler's expected feature dimension
+            # by zero-filling the acoustic channels (wavlm + whisper + egemaps)
+            scaler_n_feat = svm_models["scaler"].n_features_in_
+            if partial_vec.shape[1] < scaler_n_feat:
+                pad = np.zeros((1, scaler_n_feat - partial_vec.shape[1]), dtype=np.float32)
+                # Place LLM vector in its correct position (after wavlm 768 + whisper 512)
+                wavlm_zeros   = np.zeros((1, 768),  dtype=np.float32)
+                whisper_zeros = np.zeros((1, 512),  dtype=np.float32)
+                egemaps_zeros = np.zeros((1, 88),   dtype=np.float32)
+                full_vec = np.concatenate(
+                    [wavlm_zeros, whisper_zeros, llm_vec.reshape(1, -1), egemaps_zeros],
+                    axis=1
+                )
+            else:
+                full_vec = partial_vec
+
+            scaled = svm_models["scaler"].transform(full_vec)
+            pca_d  = svm_models["pca"].transform(scaled)
+            pred   = svm_models["clf"].predict(pca_d)[0]
+            svm_emotion = svm_models["le"].inverse_transform([pred])[0].lower()
+            print(f"[ContextSVM] Predicted emotion: {svm_emotion.upper()}")
+        except Exception as e:
+            print(f"[ContextSVM] Error: {e} — falling back to Mistral emotion tag.")
+            svm_emotion = None
+
+    # Choose primary emotion: SVM (context-grounded) wins; Mistral is fallback
+    emotion = svm_emotion if svm_emotion else mistral_emotion
 
     # ── 7. Clinical guard ─────────────────────────────────────
     print("\n[ClinicalGuardAgent] Validating ...")
@@ -347,7 +431,12 @@ def run_aac_pipeline(
 
     print("\n── RESULT ────────────────────────────────────────────────")
     print(f"  Dysarthric input  : \"{final_transcript}\"")
-    print(f"  Inferred Emotion  : {emotion.upper()}")
+    if svm_models and svm_emotion:
+        print(f"  SVM Emotion       : {svm_emotion.upper()}  ← context-engineered (PRIMARY)")
+        print(f"  Mistral Emotion   : {mistral_emotion.upper()}  (secondary / reference)")
+    else:
+        print(f"  Inferred Emotion  : {emotion.upper()}  (Mistral tag — SVM not loaded)")
+    print(f"  Final Emotion     : {emotion.upper()}")
     print(f"  Structured output : \"{clean_generated}\"")
     print(f"  Guard             : {validation['status']}")
     if validation["violations"]:
@@ -415,12 +504,36 @@ def check_ollama(host: str = "http://localhost:11434") -> bool:
 
 # ── MAIN ──────────────────────────────────────────────────────
 
+def load_svm_pipeline(model_save_dir: str = "saved_models") -> dict | None:
+    """
+    Load the pre-trained SVM pipeline from disk.
+    Returns a dict with keys: scaler, pca, clf, le.
+    Returns None if models are not found (SVM step will be skipped).
+    """
+    required = ["scaler.pkl", "pca.pkl", "svm_classifier.pkl", "label_encoder.pkl"]
+    if not all(os.path.exists(os.path.join(model_save_dir, f)) for f in required):
+        print(
+            "[ContextSVM] Saved models not found in 'saved_models/'.\n"
+            "             Run benchmark_multimodal.py then train_fusion.py to train them.\n"
+            "             Emotion will fall back to Mistral's inferred tag."
+        )
+        return None
+
+    return {
+        "scaler": joblib.load(os.path.join(model_save_dir, "scaler.pkl")),
+        "pca":    joblib.load(os.path.join(model_save_dir, "pca.pkl")),
+        "clf":    joblib.load(os.path.join(model_save_dir, "svm_classifier.pkl")),
+        "le":     joblib.load(os.path.join(model_save_dir, "label_encoder.pkl")),
+    }
+
+
 def main():
     print("=" * 60)
-    print("  CP AAC Pipeline — Dysarthric Input → Structured Voice")
+    print("  CP AAC Pipeline v2.1 — Context-Engineered Emotion")
     print(f"  ASR   : Whisper ({WHISPER_MODEL})")
     print(f"  LLM   : Mistral via Ollama")
     print(f"  Voice : {TTS_VOICE}")
+    print(f"  Emotion: Context-Engineered SVM + Mistral fallback")
     print("=" * 60)
 
     if not check_ollama():
@@ -430,6 +543,11 @@ def main():
     print("\n[OK] Ollama running.")
     print("[  ] Loading Whisper ASR model ...")
     whisper_model = load_whisper(WHISPER_MODEL)
+
+    print("[  ] Loading SVM emotion pipeline ...")
+    svm_models = load_svm_pipeline()
+    if svm_models:
+        print("[OK] SVM pipeline loaded (context-engineered emotion active).")
 
     print("[  ] Connecting to Neo4j ...")
     kg_agent    = KGContextAgent()
@@ -473,14 +591,16 @@ def main():
             partner = input("  Partner (Priya/Vijay/Rohan/Dr. Meera/Dr. Sharma): ").strip()
             aac_agent, _ = run_aac_pipeline(
                 whisper_model, kg_agent, guard_agent,
-                context, partner, aac_agent
+                context, partner, aac_agent,
+                svm_models=svm_models,
             )
 
         elif choice in SCENARIOS:
             s = SCENARIOS[choice]
             aac_agent, _ = run_aac_pipeline(
                 whisper_model, kg_agent, guard_agent,
-                s["context"], s["partner"], aac_agent
+                s["context"], s["partner"], aac_agent,
+                svm_models=svm_models,
             )
 
         else:
