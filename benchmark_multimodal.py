@@ -65,11 +65,10 @@ base_data = []
 
 print(f"\n>>> STAGE 2: Processing Audio (Extracting Vectors & Generating Text)...")
 with torch.no_grad():
-    for i in tqdm(range(min(SAMPLE_SIZE, len(dataset)))):
+    # ── PART A: The Original 20,000 Baseline Clips ──
+    for i in tqdm(range(min(SAMPLE_SIZE, len(dataset))), desc="Baseline (20k)"):
         item = dataset[i]
         emotion = item["emotion"]
-        
-        # Loop through both speakers to get all 20,000 clips
         for speaker in ["F01", "M03"]:
             audio_path = os.path.join(AUDIO_DIR, speaker, f"{speaker}_clip_{i}_{emotion}.wav")
             if not os.path.exists(audio_path):
@@ -83,16 +82,56 @@ with torch.no_grad():
             
             # 2. Whisper Transcription & Vector
             f_in = whisper_proc(arr, sampling_rate=16000, return_tensors="pt").input_features.to(device)
-            
-            # Translate dysarthric audio to English Text!
             predicted_ids = whisper_model.generate(f_in, language="english", task="transcribe")
             transcription = whisper_proc.batch_decode(predicted_ids, skip_special_tokens=True)[0]
             
-            # Get Whisper Acoustic Vector
             encoder_outputs = whisper_model.get_encoder()(f_in)
             wh_out = encoder_outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
             
             # 3. eGeMAPS Vector
+            egemaps_df = smile.process_signal(arr, sr)
+            egemaps_vec = egemaps_df.values.flatten().astype(np.float32)
+            
+            base_data.append({
+                "label": emotion,
+                "speaker": speaker,
+                "transcription": transcription,
+                "wavlm_vector": w_out,
+                "whisper_vector": wh_out,
+                "egemaps_vector": egemaps_vec
+            })
+
+    # ── PART B: The New 320 Clinical Evaluation Clips ──
+    NEW_DATASET_DIR = "../speech_synthesis_dataset/output_dataset"
+    if os.path.exists(NEW_DATASET_DIR):
+        print("\n>>> Parsing newly added curated dataset...")
+        new_files = []
+        for root, _, files in os.walk(NEW_DATASET_DIR):
+            for file in files:
+                if file.endswith(".wav"):
+                    new_files.append(os.path.join(root, file))
+                    
+        for audio_path in tqdm(new_files, desc="Curated (320)"):
+            # Structure is output_dataset/Speaker/Emotion/filename.wav
+            parts = audio_path.split(os.sep)
+            emotion = parts[-2]
+            speaker = parts[-3]
+            
+            arr, sr = librosa.load(audio_path, sr=16000)
+            
+            # 1. WavLM
+            ten = torch.tensor(arr).unsqueeze(0).to(device)
+            w_out = wavlm(ten).last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+            
+            # 2. Whisper
+            f_in = whisper_proc(arr, sampling_rate=16000, return_tensors="pt").input_features.to(device)
+            predicted_ids = whisper_model.generate(f_in, language="english", task="transcribe")
+            transcription = whisper_proc.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            
+            encoder_outputs = whisper_model.get_encoder()(f_in)
+            wh_out = encoder_outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+            
+            # 3. eGeMAPS
             egemaps_df = smile.process_signal(arr, sr)
             egemaps_vec = egemaps_df.values.flatten().astype(np.float32)
             

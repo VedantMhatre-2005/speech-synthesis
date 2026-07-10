@@ -1,43 +1,47 @@
 """
-CP Speech Synthesis — Full AAC Pipeline
-  Dysarthric audio input → Whisper ASR → User approval
-  → Mistral + KG context → edge-tts audio output
+CP Speech Synthesis — Full AAC Pipeline (Deep Learning Edition)
+Dysarthric audio -> Whisper ASR -> User approval
+-> Multimodal DL Emotion Inference -> Edge-TTS Audio Output
 
 Prerequisites:
-    1. Neo4j Desktop running  →  database created and started
-    2. ollama serve           →  in a separate terminal
-    3. ollama pull mistral    →  once
-    4. Internet connection    →  edge-tts neural voice API
-    5. Microphone             →  for live recording
-
-Run:
-    python main.py
-
-Alternatively, provide a pre-recorded .wav file when prompted.
+    1. Neo4j Desktop running
+    2. ollama serve 
+    3. python train_fusion.py (to generate models in saved_models/)
 """
 
 import os
 import re
+import json
+import torch
+import torch.nn as nn
 import asyncio
 import requests
 import datetime
 import threading
+import joblib
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import pygame
-import whisper
-import edge_tts
+import librosa
+import opensmile
+from transformers import WavLMModel, WhisperForConditionalGeneration, WhisperProcessor
+from peft import PeftModel
 from agents import KGContextAgent, OllamaMistralAgent, ClinicalGuardAgent
 
 # ── CONFIG ────────────────────────────────────────────────────
 AUDIO_OUTPUT_DIR  = "audio_outputs"
 AUDIO_INPUT_DIR   = "audio_inputs"
-TTS_VOICE         = "en-US-AnaNeural"   # child neural voice
-WHISPER_MODEL     = "base"              # tiny / base / small / medium
-                                        # base is best balance for dysarthric speech
-SAMPLE_RATE       = 16000               # Whisper expects 16kHz
-MAX_RECORD_SECS   = 15                  # safety ceiling for live recording
+TTS_VOICE         = "en-US-AnaNeural"
+WHISPER_MODEL     = "openai/whisper-small"
+LORA_PATH         = "../whisper-dysarthric-lora/checkpoint-500"
+SAMPLE_RATE       = 16000
+MAX_RECORD_SECS   = 15
+
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
+OLLAMA_MODEL = "llama3.1:8b"
+EMBED_MODEL = "nomic-embed-text"
 
 SCENARIOS = {
     "1": {"context": "morning",  "partner": "Priya"},
@@ -47,445 +51,323 @@ SCENARIOS = {
     "5": {"context": "physio",   "partner": "Dr. Sharma"},
 }
 
+# ── CROSS-ATTENTION NETWORK ARCHITECTURE ──────────────────────
+class CrossModalAttentionNetwork(nn.Module):
+    def __init__(self, audio_dim, text_dim, hidden_dim=256, num_classes=5):
+        super().__init__()
+        self.audio_proj = nn.Linear(audio_dim, hidden_dim)
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
+        self.cross_attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, num_classes)
+        )
 
-# ── WHISPER ASR ───────────────────────────────────────────────
+    def forward(self, audio_feat, text_feat):
+        a_proj = self.audio_proj(audio_feat).unsqueeze(1)
+        t_proj = self.text_proj(text_feat).unsqueeze(1)
+        attn_out, _ = self.cross_attention(query=t_proj, key=a_proj, value=a_proj)
+        attn_out = attn_out.squeeze(1)
+        t_proj = t_proj.squeeze(1)
+        fused = torch.cat([attn_out, t_proj], dim=1)
+        return self.classifier(fused)
 
-def load_whisper(model_name: str = WHISPER_MODEL):
-    """
-    Loads Whisper model onto GPU if available, else CPU.
-    Downloads once (~150MB for base), cached after.
-    """
-    print(f"\n[Whisper] Loading model: '{model_name}' ...")
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model  = whisper.load_model(model_name, device=device)
-    print(f"[Whisper] Ready on {device.upper()}.")
-    return model
+# ── GLOBAL MODELS ─────────────────────────────────────────────
+device = "cuda" if torch.cuda.is_available() else "cpu"
+global_models = {}
 
-
-def transcribe_audio(whisper_model, audio_path: str) -> str:
-    """
-    Transcribes a WAV/MP3 file using Whisper.
-    Uses a prompt that biases Whisper toward dysarthric child speech patterns —
-    short fragments, missing function words, simplified grammar.
-    """
-    print(f"\n[Whisper] Transcribing: {audio_path}")
-
-    result = whisper_model.transcribe(
-        audio_path,
-        language="en",
-        # Initial prompt biases Whisper toward fragmented child speech
-        initial_prompt=(
-            "Child speech with cerebral palsy. "
-            "Short phrases. Incomplete sentences. "
-            "Words may be unclear or fragmented."
-        ),
-        temperature=0.0,        # greedy decoding — more deterministic
-        best_of=1,
-        fp16=False,             # safer across hardware
+def load_all_models():
+    print(f"\n[System] Loading Multimodal AI Models onto {device.upper()}...")
+    
+    # 1. WavLM
+    print("  -> Loading WavLM (Acoustic)...")
+    global_models['wavlm'] = WavLMModel.from_pretrained("microsoft/wavlm-base-plus").to(device)
+    
+    # 2. Whisper
+    print("  -> Loading Whisper-LoRA (ASR)...")
+    whisper_proc = WhisperProcessor.from_pretrained(WHISPER_MODEL)
+    base_whisper = WhisperForConditionalGeneration.from_pretrained(WHISPER_MODEL).to(device)
+    whisper_model = PeftModel.from_pretrained(base_whisper, LORA_PATH)
+    global_models['whisper_proc'] = whisper_proc
+    global_models['whisper'] = whisper_model
+    
+    # 3. OpenSMILE
+    print("  -> Loading OpenSMILE (eGeMAPS)...")
+    global_models['smile'] = opensmile.Smile(
+        feature_set=opensmile.FeatureSet.eGeMAPSv02, 
+        feature_level=opensmile.FeatureLevel.Functionals
     )
+    
+    # 4. PyTorch MulT Fusion Model & Scalers
+    print("  -> Loading Cross-Attention Fusion Model...")
+    le = joblib.load("saved_models/label_encoder.pkl")
+    audio_scaler = joblib.load("saved_models/audio_scaler.pkl")
+    text_scaler = joblib.load("saved_models/text_scaler.pkl")
+    
+    num_classes = len(le.classes_)
+    dl_model = CrossModalAttentionNetwork(1624, 768, 256, num_classes).to(device)
+    dl_model.load_state_dict(torch.load("saved_models/cross_attention_model.pth", map_location=device))
+    dl_model.eval()
+    
+    global_models['le'] = le
+    global_models['audio_scaler'] = audio_scaler
+    global_models['text_scaler'] = text_scaler
+    global_models['dl_model'] = dl_model
+    
+    print("[System] All models loaded successfully!\n")
 
-    transcript = result["text"].strip()
-    print(f"[Whisper] Raw transcript: \"{transcript}\"")
-    return transcript
 
+# ── FEATURE EXTRACTION & INFERENCE ─────────────────────────────
+def get_llm_reasoning(text):
+    prompt = f'Text: "{text}"\nDescribe the likely emotional state of the speaker in 3-5 keywords. Output ONLY the keywords separated by commas.'
+    payload = {"model": OLLAMA_MODEL, "messages": [{"role": "user", "content": prompt}], "stream": False, "options": {"temperature": 0.3}}
+    try:
+        res = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=60)
+        return res.json()["message"]["content"].strip()
+    except:
+        return "neutral, calm"
 
-# ── LIVE RECORDING ────────────────────────────────────────────
+def get_semantic_vector(reasoning_text):
+    try:
+        res = requests.post(OLLAMA_EMBED_URL, json={"model": EMBED_MODEL, "input": reasoning_text}, timeout=30)
+        return np.array(res.json()["embeddings"][0], dtype=np.float32)
+    except:
+        return np.zeros(768, dtype=np.float32)
 
+def transcribe_and_extract(audio_path: str):
+    """
+    Returns (transcript, wavlm_vec, whisper_vec, egemaps_vec)
+    """
+    print(f"\n[Multimodal] Processing Audio: {audio_path}")
+    arr, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
+    
+    # 1. WavLM
+    with torch.no_grad():
+        ten = torch.tensor(arr).unsqueeze(0).to(device)
+        wavlm_vec = global_models['wavlm'](ten).last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+    
+    # 2. Whisper ASR + Encoded Vector
+    w_proc = global_models['whisper_proc']
+    w_mod = global_models['whisper']
+    
+    f_in = w_proc(arr, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_features.to(device)
+    with torch.no_grad():
+        predicted_ids = w_mod.generate(f_in, language="english", task="transcribe")
+        transcript = w_proc.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        
+        encoder_outputs = w_mod.get_encoder()(f_in)
+        whisper_vec = encoder_outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+        
+    # 3. eGeMAPS
+    egemaps_df = global_models['smile'].process_signal(arr, sr)
+    egemaps_vec = egemaps_df.values.flatten().astype(np.float32)
+    
+    print(f"[Whisper ASR] Raw Transcript: \"{transcript}\"")
+    return transcript, wavlm_vec, whisper_vec, egemaps_vec
+
+def predict_emotion(wavlm_vec, whisper_vec, egemaps_vec, final_transcript):
+    print("[Multimodal] Inferring Deep Learning Emotion...")
+    
+    # Text Modality
+    reasoning = get_llm_reasoning(final_transcript)
+    llm_vec = get_semantic_vector(reasoning)
+    
+    # Audio Modality
+    audio_concat = np.concatenate([wavlm_vec, whisper_vec, egemaps_vec])
+    
+    # Scale
+    a_scaled = global_models['audio_scaler'].transform([audio_concat])
+    t_scaled = global_models['text_scaler'].transform([llm_vec])
+    
+    # PyTorch Forward Pass
+    a_tensor = torch.FloatTensor(a_scaled).to(device)
+    t_tensor = torch.FloatTensor(t_scaled).to(device)
+    
+    with torch.no_grad():
+        preds = global_models['dl_model'](a_tensor, t_tensor)
+        class_idx = preds.argmax(dim=1).item()
+        
+    predicted_label = global_models['le'].inverse_transform([class_idx])[0]
+    print(f"  -> Predicted Emotion Tag: {predicted_label}")
+    
+    # Map back to Edge-TTS friendly strings
+    mapping = {
+        "HAP": "happy", "SAD": "sad", "FEA": "fear", "ANG": "angry", 
+        "NEU": "neutral", "DIS": "angry", "CAL": "neutral", "SUR": "happy"
+    }
+    return mapping.get(predicted_label, "neutral")
+
+# ── LIVE RECORDING & APPROVAL ─────────────────────────────────
 def record_audio(max_seconds: int = MAX_RECORD_SECS) -> str:
-    """
-    Records from the default microphone until the user presses Enter.
-    Saves to audio_inputs/ and returns the file path.
-    """
     os.makedirs(AUDIO_INPUT_DIR, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename  = os.path.join(AUDIO_INPUT_DIR, f"input_{timestamp}.wav")
 
-    print(f"\n[MIC] Recording ... speak now.")
-    print(f"      Press ENTER to stop (max {max_seconds}s).")
-
-    frames     = []
-    recording  = True
+    print(f"\n[MIC] Recording ... speak now. Press ENTER to stop.")
+    frames, recording = [], True
 
     def _record():
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                             dtype="float32") as stream:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
             while recording:
-                data, _ = stream.read(SAMPLE_RATE // 10)  # 100ms chunks
+                data, _ = stream.read(SAMPLE_RATE // 10)
                 frames.append(data.copy())
 
-    # Record in background thread so Enter press can stop it
     t = threading.Thread(target=_record, daemon=True)
     t.start()
-    input()                # blocks until Enter
+    input()
     recording = False
     t.join(timeout=1)
 
     if not frames:
-        print("[MIC] No audio captured.")
         return ""
 
-    audio = np.concatenate(frames, axis=0).flatten()
-
-    # Enforce max duration
-    max_samples = SAMPLE_RATE * max_seconds
-    audio = audio[:max_samples]
-
+    audio = np.concatenate(frames, axis=0).flatten()[:SAMPLE_RATE * max_seconds]
     sf.write(filename, audio, SAMPLE_RATE)
-    duration = len(audio) / SAMPLE_RATE
-    print(f"[MIC] Recorded {duration:.1f}s → {filename}")
     return filename
 
-
-# ── APPROVAL GATE ─────────────────────────────────────────────
-
 def approval_gate(transcript: str) -> tuple[bool, str]:
-    """
-    Shows the ASR transcript to the user and asks for approval.
-    The user can:
-      [y]        approve as-is
-      [e]        edit the transcript manually
-      [n]        discard and start over
-    Returns (approved: bool, final_transcript: str).
-    """
     print("\n" + "─" * 58)
     print("  ASR TRANSCRIPT (what Whisper heard):")
     print(f"\n    \"{transcript}\"\n")
     print("  Is this correct?")
     print("  [y] Yes, use this         (proceed to generation)")
     print("  [e] Edit it manually      (correct misheard words)")
-    print("  [n] No, discard and retry (re-record or re-enter)")
+    print("  [n] No, discard and retry (re-record)")
     print("─" * 58)
-
     while True:
         choice = input("  Your choice: ").strip().lower()
-
-        if choice == "y":
-            return True, transcript
-
+        if choice == "y": return True, transcript
         elif choice == "e":
-            print(f"\n  Current: \"{transcript}\"")
             edited = input("  Enter corrected transcript: ").strip()
-            if edited:
-                print(f"\n  Updated transcript: \"{edited}\"")
-                confirm = input("  Confirm? [y/n]: ").strip().lower()
-                if confirm == "y":
-                    return True, edited
-            else:
-                print("  [!] Empty input. Keeping original.")
-                return True, transcript
-
-        elif choice == "n":
-            return False, ""
-
-        else:
-            print("  [!] Please enter y, e, or n.")
-
+            if edited: return True, edited
+            return True, transcript
+        elif choice == "n": return False, ""
+        else: print("  [!] Please enter y, e, or n.")
 
 # ── TTS OUTPUT ────────────────────────────────────────────────
-
 EMOTION_PROSODY = {
     "happy":   {"rate": "+15%", "pitch": "+20Hz", "volume": "+0%"},
     "sad":     {"rate": "-20%", "pitch": "-15Hz", "volume": "-10%"},
-    "tired":   {"rate": "-30%", "pitch": "-25Hz", "volume": "-20%"},
     "angry":   {"rate": "+10%", "pitch": "-10Hz", "volume": "+25%"},
     "neutral": {"rate": "+0%",  "pitch": "+0Hz",  "volume": "+0%"},
+    "fear":    {"rate": "+25%", "pitch": "+30Hz", "volume": "-10%"},
 }
 
 def clean_text_for_tts(text: str) -> str:
-    text    = re.sub(r"[\"\'*•\-]", "", text)
-    text    = re.sub(r"\[.*?\]",    "", text)
-    text    = re.sub(r"\(.*?\)",    "", text)
-    phrases = re.split(r"[\n,]+", text)
-    phrases = [p.strip() for p in phrases if p.strip()]
-    cleaned = ". ".join(phrases)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if cleaned and not cleaned.endswith("."):
-        cleaned += "."
-    return cleaned
-
+    text = re.sub(r"[\"\'*•\-]", "", text)
+    text = re.sub(r"\[.*?\]", "", text).strip()
+    return text + "." if text and not text.endswith(".") else text
 
 async def _synthesize_async(text: str, voice: str, filename: str, prosody: dict):
     communicate = edge_tts.Communicate(
-        text=text, 
-        voice=voice,
+        text=text, voice=voice,
         rate=prosody.get("rate", "+0%"),
         pitch=prosody.get("pitch", "+0%"),
         volume=prosody.get("volume", "+0%")
     )
     await communicate.save(filename)
 
-
 def synthesize_and_play(text: str, emotion: str = "neutral", label: str = "output") -> str:
     os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
     timestamp  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_label = re.sub(r"\W+", "_", label)[:30]
-    filename   = os.path.join(AUDIO_OUTPUT_DIR, f"{safe_label}_{timestamp}.mp3")
+    filename   = os.path.join(AUDIO_OUTPUT_DIR, f"{label}_{timestamp}.mp3")
 
     cleaned = clean_text_for_tts(text)
-    if not cleaned:
-        print("[TTS] Nothing to synthesize.")
-        return ""
+    if not cleaned: return ""
 
     prosody = EMOTION_PROSODY.get(emotion.lower(), EMOTION_PROSODY["neutral"])
-
-    print(f"\n[TTS] Voice      : {TTS_VOICE}")
-    print(f"[TTS] Emotion    : {emotion.upper()}")
-    print(f"[TTS] Prosody    : Rate={prosody['rate']}, Pitch={prosody['pitch']}, Vol={prosody['volume']}")
-    print(f"[TTS] Synthesizing: \"{cleaned}\"")
+    print(f"\n[TTS] Emotion : {emotion.upper()} | Synthesizing: \"{cleaned}\"")
 
     asyncio.run(_synthesize_async(cleaned, TTS_VOICE, filename, prosody))
-    print(f"[TTS] Saved → {filename}")
-
+    
     pygame.mixer.init()
     pygame.mixer.music.load(filename)
     pygame.mixer.music.play()
-    print("[TTS] Playing ...")
     while pygame.mixer.music.get_busy():
         pygame.time.Clock().tick(10)
-
     return filename
 
-
 # ── CORE PIPELINE ─────────────────────────────────────────────
-
-def run_aac_pipeline(
-    whisper_model,
-    kg_agent,
-    guard_agent,
-    context:   str,
-    partner:   str,
-    aac_agent  = None,
-    audio_path: str = "",
-) -> tuple:
-    """
-    Full pipeline:
-      audio → ASR → approval → KG context → Mistral → TTS
-    Returns (aac_agent, success: bool).
-    """
-
-    # ── 1. Get audio ──────────────────────────────────────────
+def run_aac_pipeline(kg_agent, guard_agent, context: str, partner: str, aac_agent, audio_path: str = ""):
     if not audio_path:
-        print("\n  How would you like to provide your speech?")
-        print("  [1] Record live from microphone")
-        print("  [2] Provide path to an existing audio file")
+        print("\n  [1] Record live | [2] Provide path")
         src = input("  Choice: ").strip()
+        if src == "1": audio_path = record_audio()
+        elif src == "2": audio_path = input("  Path: ").strip().strip('"')
+        if not audio_path or not os.path.exists(audio_path): return aac_agent, False
 
-        if src == "1":
-            audio_path = record_audio()
-            if not audio_path:
-                print("[!] Recording failed. Aborting.")
-                return aac_agent, False
+    # ASR & Audio Vector Extraction
+    transcript, w_vec, wh_vec, e_vec = transcribe_and_extract(audio_path)
+    if not transcript: return aac_agent, False
 
-        elif src == "2":
-            audio_path = input("  Full path to audio file (.wav / .mp3): ").strip().strip('"')
-            if not os.path.exists(audio_path):
-                print(f"[!] File not found: {audio_path}")
-                return aac_agent, False
-
-        else:
-            print("[!] Invalid choice.")
-            return aac_agent, False
-
-    # ── 2. ASR — Whisper transcription ────────────────────────
-    transcript = transcribe_audio(whisper_model, audio_path)
-
-    if not transcript:
-        print("[!] Whisper returned empty transcript. Try again.")
-        return aac_agent, False
-
-    # ── 3. Approval gate ──────────────────────────────────────
+    # Approval Gate
     approved, final_transcript = approval_gate(transcript)
+    if not approved: return aac_agent, False
 
-    if not approved:
-        print("\n[Pipeline] Transcript rejected. Returning to menu.")
-        return aac_agent, False
+    # Deep Learning Emotion Inference
+    final_emotion = predict_emotion(w_vec, wh_vec, e_vec, final_transcript)
 
-    print(f"\n[Pipeline] Approved transcript: \"{final_transcript}\"")
-
-    # ── 4. KG context query ───────────────────────────────────
-    print(f"\n[KGContextAgent] Querying Neo4j — context='{context}', partner='{partner}'")
+    # KG Context
     kg_context_str = kg_agent.get_context(context, partner)
     linguistic_age = kg_agent.get_patient_linguistic_age()
-
-    print("\n── KG CONTEXT ────────────────────────────────────────────")
-    print(kg_context_str)
-
-    # ── 5. Build or update AAC agent ──────────────────────────
-    if aac_agent is None:
-        aac_agent = OllamaMistralAgent(kg_context_str, linguistic_age)
-        print("\n[OllamaMistralAgent] Agent initialised.")
-    else:
-        aac_agent.update_context(kg_context_str, linguistic_age)
-        print("\n[OllamaMistralAgent] Context updated.")
-
-    # ── 6. Mistral generation ─────────────────────────────────
-    print("[OllamaMistralAgent] Generating structured phrase ...")
-
-    prompt = (
-        f"Aarav said (fragmented dysarthric speech): \"{final_transcript}\"\n\n"
-        f"Context: {context}, talking to {partner}.\n\n"
-        "Reconstruct what Aarav meant as 1 to 3 short, clear, natural phrases "
-        "a child would say. Use his preferred vocabulary from the context above. \n"
-        "MANDATORY: Start with an emotion tag in brackets, e.g., [Happy]. \n"
-        "Keep each phrase under 6 words. First person only. No explanation."
-    )
-
-    generated = aac_agent.step(prompt)
-
-    # Parse emotion and clean text
-    emotion = "neutral"
-    match = re.search(r"\[(.*?)\]", generated)
-    if match:
-        emotion = match.group(1).lower()
     
-    clean_generated = re.sub(r"\[.*?\]", "", generated).strip()
+    # Mistral AAC Generation (Strict JSON)
+    if aac_agent is None: aac_agent = OllamaMistralAgent(kg_context_str, linguistic_age)
+    else: aac_agent.update_context(kg_context_str, linguistic_age)
 
-    # ── 7. Clinical guard ─────────────────────────────────────
-    print("\n[ClinicalGuardAgent] Validating ...")
-    validation = guard_agent.validate(generated)
-
-    print("\n── RESULT ────────────────────────────────────────────────")
-    print(f"  Dysarthric input  : \"{final_transcript}\"")
-    print(f"  Inferred Emotion  : {emotion.upper()}")
-    print(f"  Structured output : \"{clean_generated}\"")
-    print(f"  Guard             : {validation['status']}")
-    if validation["violations"]:
-        for v in validation["violations"]:
-            print(f"    ✗  {v}")
-    if validation["warnings"]:
-        for w in validation["warnings"]:
-            print(f"    ⚠  {w}")
-
-    # ── 8. TTS synthesis + playback ───────────────────────────
-    if validation["status"] == "FAIL":
-        print("\n  [!] Guard FAILED — synthesizing for demo.")
-
-    audio_out = synthesize_and_play(clean_generated, emotion=emotion, label=f"{context}_{partner}")
-
-    if audio_out:
-        print(f"\n── AUDIO OUTPUT ──────────────────────────────────────────")
-        print(f"  Input audio  : {audio_path}")
-        print(f"  Output audio : {audio_out}")
-        print(f"  Folder       : {os.path.abspath(AUDIO_OUTPUT_DIR)}")
-    print("──────────────────────────────────────────────────────────")
-
-    # ── 9. Persist to KG ──────────────────────────────────────
-    kg_agent.kg.add_episode(
-        context    = context,
-        partner    = partner,
-        utterances = clean_generated,
-        mcds       = 0.60,  # placeholder baseline
-        success    = (validation["status"] == "PASS"),
-        emotion    = emotion
+    print("\n[OllamaMistralAgent] Generating deterministic JSON phrase...")
+    prompt = (
+        f"Aarav said (fragmented): \"{final_transcript}\"\n"
+        f"Context: {context}, talking to {partner}.\n"
+        f"Detected Emotion: {final_emotion}\n"
     )
+    result_json = aac_agent.step(prompt)
+    clean_generated = result_json.get("phrase", "I am not sure.")
 
+    # Clinical Guard Validation
+    validation = guard_agent.validate(clean_generated)
+    print("\n── RESULT ────────────────────────────────────────────────")
+    print(f"  Input       : \"{final_transcript}\"")
+    print(f"  DL Emotion  : {final_emotion.upper()}")
+    print(f"  LLM Output  : \"{clean_generated}\"")
+    print(f"  Guard       : {validation['status']}")
+
+    # TTS Synthesis
+    audio_out = synthesize_and_play(clean_generated, emotion=final_emotion, label=f"{context}")
+
+    # Persist
+    kg_agent.kg.add_episode(context=context, partner=partner, utterances=clean_generated, mcds=0.60, success=(validation["status"] == "PASS"), emotion=final_emotion)
     return aac_agent, True
 
-
-# ── KG SUMMARY ────────────────────────────────────────────────
-
-def show_kg_summary(kg_agent):
-    summary = kg_agent.get_summary()
-    print("\n── NEO4J KNOWLEDGE GRAPH SUMMARY ─────────────────────────")
-    print("  Node counts:")
-    for row in summary["nodes"]:
-        print(f"    {row['label']:15s}: {row['count']}")
-    print("\n  Relationship counts:")
-    for row in summary["relationships"]:
-        print(f"    {row['type']:25s}: {row['count']}")
-    print("\n  Visualise at : http://localhost:7474")
-    print("  Cypher       : MATCH (n) RETURN n")
-    print("──────────────────────────────────────────────────────────")
-
-
-# ── OLLAMA CHECK ──────────────────────────────────────────────
-
-def check_ollama(host: str = "http://localhost:11434") -> bool:
-    """
-    Check if Ollama is running and accessible.
-    Returns True if responding, False otherwise.
-    """
-    try:
-        response = requests.get(f"{host}/api/tags", timeout=2)
-        return response.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
-        return False
-
-
 # ── MAIN ──────────────────────────────────────────────────────
-
 def main():
     print("=" * 60)
-    print("  CP AAC Pipeline — Dysarthric Input → Structured Voice")
-    print(f"  ASR   : Whisper ({WHISPER_MODEL})")
-    print(f"  LLM   : Mistral via Ollama")
-    print(f"  Voice : {TTS_VOICE}")
+    print("  CP AAC Pipeline — DEEP LEARNING EDITION")
     print("=" * 60)
-
-    if not check_ollama():
-        print("\n[ERROR] Ollama not running. Start with: ollama serve")
+    
+    try:
+        requests.get(f"{OLLAMA_CHAT_URL.replace('/api/chat','')}/api/tags", timeout=2)
+    except:
+        print("[ERROR] Ollama not running.")
         return
 
-    print("\n[OK] Ollama running.")
-    print("[  ] Loading Whisper ASR model ...")
-    whisper_model = load_whisper(WHISPER_MODEL)
-
-    print("[  ] Connecting to Neo4j ...")
-    kg_agent    = KGContextAgent()
-    guard_agent = ClinicalGuardAgent(kg_agent)
-    aac_agent   = None
-
-    print("\n[OK] All systems ready.")
-    print(f"[  ] Input audio  saved to : {os.path.abspath(AUDIO_INPUT_DIR)}")
-    print(f"[  ] Output audio saved to : {os.path.abspath(AUDIO_OUTPUT_DIR)}\n")
+    load_all_models()
+    kg_agent, guard_agent, aac_agent = KGContextAgent(), ClinicalGuardAgent(KGContextAgent()), None
 
     while True:
         print("\n── MAIN MENU ─────────────────────────────────────────────")
-        print("  SPEAK AS AARAV — select context first, then provide audio\n")
-        for k, v in SCENARIOS.items():
-            print(f"  [{k}] {v['context']:10s} | Partner: {v['partner']}")
-        print("  [c]   Custom context + partner")
-        print("  [r]   Reset conversation history")
-        print("  [g]   Show KG summary")
-        print("  [q]   Quit")
-
-        choice = input("\nYour choice: ").strip().lower()
+        for k, v in SCENARIOS.items(): print(f"  [{k}] {v['context']:10s} | Partner: {v['partner']}")
+        choice = input("\nYour choice (q to quit): ").strip().lower()
 
         if choice == "q":
             kg_agent.close()
             pygame.mixer.quit()
-            print("\n[EXIT] Goodbye.")
             break
-
-        elif choice == "g":
-            show_kg_summary(kg_agent)
-
-        elif choice == "r":
-            if aac_agent:
-                aac_agent.reset_history()
-                print("\n[OK] Conversation history cleared.")
-            else:
-                print("\n[OK] No history yet.")
-
-        elif choice == "c":
-            context = input("  Context (morning/school/therapy/physio/evening): ").strip()
-            partner = input("  Partner (Priya/Vijay/Rohan/Dr. Meera/Dr. Sharma): ").strip()
-            aac_agent, _ = run_aac_pipeline(
-                whisper_model, kg_agent, guard_agent,
-                context, partner, aac_agent
-            )
-
         elif choice in SCENARIOS:
             s = SCENARIOS[choice]
-            aac_agent, _ = run_aac_pipeline(
-                whisper_model, kg_agent, guard_agent,
-                s["context"], s["partner"], aac_agent
-            )
-
-        else:
-            print("[!] Invalid choice.")
-
+            aac_agent, _ = run_aac_pipeline(kg_agent, guard_agent, s["context"], s["partner"], aac_agent)
 
 if __name__ == "__main__":
     main()

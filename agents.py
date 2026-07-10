@@ -7,7 +7,7 @@ import re
 from knowledge_graph import Neo4jKG, format_context_for_prompt
 
 OLLAMA_URL   = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3:14B"
+OLLAMA_MODEL = "llama3.1:8b"
 
 
 # ── 1. KG CONTEXT AGENT ───────────────────────────────────────
@@ -48,31 +48,19 @@ class KGContextAgent:
         self.kg.close()
 
 
-# ── 2. OLLAMA MISTRAL AGENT ───────────────────────────────────
+# ── 2. OLLAMA MISTRAL AGENT (JSON & FEW-SHOT) ─────────────────
 
 class OllamaMistralAgent:
     """
-    Sends structured chat messages to Qwen/Mistral running inside Ollama.
-    Maintains conversation history (last 10 turns).
+    Sends structured chat messages to Llama3.1 running inside Ollama.
+    Maintains conversation history and forces strict JSON output.
     """
 
     def __init__(self, kg_context_str: str, linguistic_age: float):
         self.history       = []
-        self.system_prompt = (
-            "You are an AAC assistant for Aarav (CP child, dysarthric speech). "
-            f"Linguistic age: {linguistic_age:.1f} years. \n\n"
-            "MANDATORY: Output ONLY the bracketed emotion and the reconstructed phrase. "
-            "Do NOT use chain-of-thought. Do NOT 'think' out loud. Response must be IMMEDIATE. \n\n"
-            "Format: [Emotion] Phrase \n"
-            "Allowed emotions: [Happy], [Sad], [Angry], [Tired], [Neutral]. \n\n"
-            "Tasks:\n"
-            "1. Infer emotion from his fragmented words.\n"
-            "2. Reconstruct intent into 1-3 short first-person phrases (max 5 words each).\n"
-            "3. Use only his preferred vocabulary.\n\n"
-            + kg_context_str
-        )
+        self.update_context(kg_context_str, linguistic_age)
 
-    def step(self, user_message: str) -> str:
+    def step(self, user_message: str) -> dict:
         self.history.append({"role": "user", "content": user_message})
         trimmed = self.history[-10:]
 
@@ -81,7 +69,8 @@ class OllamaMistralAgent:
             "messages": [{"role": "system", "content": self.system_prompt}]
                         + trimmed,
             "stream":   False,
-            "options":  {"temperature": 0.7, "num_predict": 1000},
+            "format":   "json",
+            "options":  {"temperature": 0.2, "num_predict": 150},
         }
 
         try:
@@ -91,25 +80,30 @@ class OllamaMistralAgent:
             if "message" in res_json and "content" in res_json["message"]:
                 reply = res_json["message"]["content"].strip()
             else:
-                reply = f"[ERROR] Unexpected Ollama response: {res_json}"
-        except requests.exceptions.ConnectionError:
-            reply = "[ERROR] Ollama not running. Run: ollama serve"
-        except requests.exceptions.Timeout:
-            reply = f"[ERROR] Timeout with model {OLLAMA_MODEL}"
+                reply = '{"phrase": "[ERROR] Unexpected Ollama response"}'
         except Exception as e:
-            reply = f"[ERROR] {str(e)}"
+            reply = f'{{"phrase": "[ERROR] {str(e)}"}}'
 
         self.history.append({"role": "assistant", "content": reply})
-        return reply
+        import json
+        try:
+            return json.loads(reply)
+        except:
+            return {"phrase": reply}
 
     def update_context(self, kg_context_str: str, linguistic_age: float):
         """Call this when context changes (new scenario) but history should persist."""
         self.system_prompt = (
             "You are an AAC assistant for Aarav, a child with cerebral palsy. "
             f"Aarav's linguistic age is {linguistic_age:.1f} years. \n"
-            "MANDATORY: NO reasoning. NO thinking. Immediate response only. \n"
-            "Format: [Emotion] Phrase. \n"
+            "MANDATORY: You MUST respond ONLY with a valid JSON object. \n"
+            "Format: {\"phrase\": \"<reconstructed text>\"} \n"
             "Max 5 words per phrase. No commentary.\n\n"
+            "FEW-SHOT EXAMPLES:\n"
+            "User: Context: morning. Speech: \"n-nn-eed m-i-lk\"\n"
+            "Assistant: {\"phrase\": \"I need milk please.\"}\n"
+            "User: Context: therapy. Speech: \"h-h-urts l-e-g\"\n"
+            "Assistant: {\"phrase\": \"My leg hurts a lot.\"}\n\n"
             + kg_context_str
         )
 
