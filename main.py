@@ -25,6 +25,7 @@ import soundfile as sf
 import pygame
 import librosa
 import opensmile
+import edge_tts
 from transformers import WavLMModel, WhisperForConditionalGeneration, WhisperProcessor
 from peft import PeftModel
 from agents import KGContextAgent, OllamaMistralAgent, ClinicalGuardAgent
