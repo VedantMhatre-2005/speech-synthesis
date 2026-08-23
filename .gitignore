@@ -33,3 +33,8 @@ benchmarks/results/
 *.pt
 *.zip
 __pycache__/
+
+# Results and Logs
+*.log
+*.pth
+*.txt
