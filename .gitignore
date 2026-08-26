@@ -26,3 +26,15 @@ speech-synthesis/extracted_features/
 *.tar.gz
 *.wav
 *.mp3
+
+# Benchmarks
+benchmarks/data/
+benchmarks/results/
+*.pt
+*.zip
+__pycache__/
+
+# Results and Logs
+*.log
+*.pth
+*.txt
